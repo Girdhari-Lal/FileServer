@@ -1,0 +1,7 @@
+{
+    "name": "PartnerB",
+    "as2_id": "PARTNERB",
+    "url": "https://partnerb.example.com/as2",
+    "cert_file": "partnerb_cert.pem",
+    "private_key_file": null
+}

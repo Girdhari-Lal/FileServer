@@ -1,0 +1,7 @@
+{
+    "name": "PartnerA",
+    "as2_id": "PARTNERA",
+    "url": "http://168.231.112.105:8000/",
+    "cert_file": "partnera_cert.pem",
+    "private_key_file": null
+}

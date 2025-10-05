@@ -1,0 +1,7 @@
+{
+    "sender_id": "PARTNERB",
+    "receiver_id": "PARTNERA",
+    "encryption": "AES256",
+    "signature": "SHA256",
+    "mic_algo": "SHA256"
+}
