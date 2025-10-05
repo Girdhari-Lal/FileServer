@@ -77,11 +77,17 @@ class PeriodicTaskSerializer(serializers.ModelSerializer):
     interval = IntervalScheduleSerializer(required=False, allow_null=True)
     crontab = CrontabScheduleSerializer(required=False, allow_null=True)
     kwargs = serializers.JSONField(required=False)
+    last_run_at = serializers.SerializerMethodField()
 
     class Meta:
         model = PeriodicTask
         fields = "__all__"
 
+    def get_last_run_at(self, obj):
+        if obj.last_run_at:
+            return obj.last_run_at.strftime("%Y-%m-%d %H:%M:%S")
+        return None
+        
     def validate(self, data):
         interval, crontab = data.get("interval"), data.get("crontab")
         if bool(interval) == bool(crontab):

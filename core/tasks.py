@@ -48,13 +48,13 @@ def dynamic_task(self, **kwargs):
             line = line.strip()
             if line:
                 logs.append(f"[STDERR] {line}")
-                logger.error(f"[PID {process.os.getpid()}] {line}")
+                logger.error(f"[PID {self.request.id}] {line}")
         process.wait()
         if process.returncode == 0:
-            final_msg = f"SFTP succeeded for {kwargs['host']}:{kwargs['port']}"
+            final_msg = f"operation succeeded for {kwargs['host']}:{kwargs['port']}"
             status = "SUCCESS"
         else:
-            final_msg = f"SFTP failed with exit code {process.returncode}"
+            final_msg = f"operation failed with exit code {process.returncode}"
             status = "FAILED"
         logs.append(final_msg)
     except Exception as ex:
@@ -77,7 +77,6 @@ def dynamic_task(self, **kwargs):
         "status": status,
         "message": final_msg
     }
-
 
 def create_virtual_env(script_name):
     venv_dir = os.path.join(BASE_VENV_DIR, script_name)
