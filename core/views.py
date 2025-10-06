@@ -11,6 +11,7 @@ import shutil
 from rest_framework.permissions import IsAuthenticated
 from user.permission import IsAdminUser
 from rest_framework.settings import api_settings
+from django.db.models import Q
 
 class ConfigCreateView(APIView):
 
@@ -273,6 +274,18 @@ class TaskLogView(APIView):
         process_id = request.query_params.get("process_id") or request.data.get("process_id")
         status_value = request.query_params.get("status") or request.data.get("status")
         task_name = request.query_params.get("task_name") or request.data.get("task_name")
+        search = request.query_params.get("search") or request.data.get("search")
+        if search is not None:
+            try:
+                log = TaskLog.objects.filter(
+                    Q(id__iexact=search) |            
+                    Q(task_name__icontains=search) |    
+                    Q(process_id__icontains=search)    
+                )
+            except TaskLog.DoesNotExist:
+                return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
+            serializer = TaskLogSerializer(log, many=True)
+            return Response(serializer.data)
         if process_id is not None:
             try:
                 log = TaskLog.objects.get(process_id=process_id)
@@ -280,8 +293,7 @@ class TaskLogView(APIView):
                 return Response({"error": "Not found"}, status=status.HTTP_404_NOT_FOUND)
             serializer = TaskLogDetailSerializer(log)
             return Response(serializer.data)
-        
-        logs = TaskLog.objects.all()
+        logs = TaskLog.objects.all().order_by('-started_at')
         if status_value is not None:
             logs = logs.filter(status=status_value)
         elif task_name is not None:
