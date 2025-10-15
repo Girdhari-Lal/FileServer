@@ -3,7 +3,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from django_celery_beat.models import IntervalSchedule, CrontabSchedule, PeriodicTask
 from core.serializers import PeriodicTaskSerializer, ScriptSerializer, TaskLogSerializer, AS2PartnerSerializer, AS2AgreementSerializer, ConfigSerializer, TaskLogDetailSerializer
-from core.tasks import dynamic_task, run_script_task
+from core.tasks import dynamic_task, run_script_task, pick_file_task, email_jar_schedule
 from core.models import Script, TaskLog, AS2Partner, AS2Agreement, PeriodicTaskMeta, Config
 import json, os
 from rest_framework.permissions import IsAuthenticated
@@ -120,6 +120,9 @@ class ConfigCreateView(APIView):
 PROCESS_TASK_MAP = {
     "file": "core.tasks.dynamic_task",
     "script": "core.tasks.run_script_task",
+    "chain": "core.tasks.orchestrator_chain_task",
+    "email": "core.tasks.email_jar_schedule",
+    "pick": "core.tasks.pick_file_task"
 }
 
 class PeriodicTaskAPI(APIView):
@@ -151,12 +154,29 @@ class PeriodicTaskAPI(APIView):
             task_path = PROCESS_TASK_MAP.get(process)
             if not task_path:
                 return Response({"error": f"Invalid process '{process}'"}, status=status.HTTP_400_BAD_REQUEST)
-            data["task"] = task_path 
-            data.pop("process", None)  
+            if process == "chain":
+                kwargs_data = data.get("kwargs", {})
+                if isinstance(kwargs_data, str):
+                    try:
+                        kwargs_data = json.loads(kwargs_data or "{}")
+                    except json.JSONDecodeError:
+                        return Response({"error": "Invalid JSON in kwargs"}, status=status.HTTP_400_BAD_REQUEST)
+
+                task_names = kwargs_data.get("task_names", [])
+                if not task_names:
+                    return Response(
+                        {"error": "No task_names provided for chain process"},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            elif process == 'file':
+                data['enabled'] = 'false'
+            data["task"] = task_path
+            data.pop("process", None)
         serializer = PeriodicTaskSerializer(data=data, context={'request': request})
         if serializer.is_valid():
             serializer.save()
             return Response(serializer.data, status=status.HTTP_201_CREATED)
+
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
         
     def patch(self, request):
@@ -197,27 +217,25 @@ class RunTaskByNameView(APIView):
     def post(self, request):
         task_name = request.data.get("name")
         if not task_name:
-            return Response({"error": "Missing parameter: name"},status=status.HTTP_400_BAD_REQUEST,)
+            return Response({"error": "Missing parameter: name"}, status=status.HTTP_400_BAD_REQUEST)    
         try:
             task_obj = PeriodicTask.objects.get(name=task_name)
         except PeriodicTask.DoesNotExist:
             return Response(
-                {"error": f"No periodic task found with name '{task_name}'"},
-                status=status.HTTP_404_NOT_FOUND,
-            )
+                {"error": f"No periodic task found with name '{task_name}'"},status=status.HTTP_404_NOT_FOUND)
         kwargs = json.loads(task_obj.kwargs or "{}")
         if task_obj.task == "core.tasks.dynamic_task":
             async_result = dynamic_task.apply_async(kwargs=kwargs)
         elif task_obj.task == "core.tasks.run_script_task":
             async_result = run_script_task.apply_async(kwargs=kwargs)
+        elif task_obj.task == "core.tasks.email_jar_schedule": 
+            async_result = email_jar_schedule.apply_async(kwargs=kwargs)  
+        elif task_obj.task == "core.tasks.pick_file_task":  
+            async_result = pick_file_task.apply_async(kwargs=kwargs)  
         else:
-            return Response({"error": f"Unsupported task type '{task_obj.task}'"},status=status.HTTP_400_BAD_REQUEST,)
-        result = async_result.get() 
-        return Response(
-            {"message": f"Task '{task_obj.name}' queued successfully", **result},
-            status=status.HTTP_202_ACCEPTED,
-        )
-
+            return Response({"error": f"Unsupported task type '{task_obj.task}'"}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"message": f"Task '{task_obj.name}' queued successfully", "task_id": async_result.id,
+                "status": "PENDING"}, status=status.HTTP_202_ACCEPTED)
         
 class ScriptCreateView(APIView):
     permission_classes = [IsAuthenticated]

@@ -1,15 +1,29 @@
 from celery import shared_task
 from django.conf import settings
-import json, time, logging, subprocess, os, sys 
+import json, logging, subprocess, os, sys 
 from core.models import TaskLog, Script
 from django.utils import timezone
 from pathlib import Path
+from django_celery_beat.models import PeriodicTask
+from celery import shared_task, chain, signature, Celery
+
 logger = logging.getLogger(__name__)
-
 BASE_VENV_DIR = os.path.join(os.getcwd(), "venvs")
+app = Celery(broker='redis://localhost:6379/0')
 
-@shared_task(bind=True) 
-def dynamic_task(self, **kwargs):
+def safe_execute(func):
+    def wrapper(*args, **kwargs):
+        try:
+            result = func(*args, **kwargs)
+            return {"status": "success", "data": result}
+        except Exception as e:
+            logger.exception(f"Error in task {func.__name__}: {e}")
+            return {"status": "failed", "error": str(e)}
+    return wrapper
+
+@app.task(bind=True, name="core.tasks.dynamic_task")
+@safe_execute
+def dynamic_task(self, *args, **kwargs):
     logs = [] 
     base_dir = Path(settings.BASE_DIR)
     config_type = kwargs.get("config_type")
@@ -75,8 +89,97 @@ def dynamic_task(self, **kwargs):
     return {
         "process_id": self.request.id,
         "status": status,
-        "message": final_msg
+        "message": logs,
+        "task_name":task_label
     }
+
+@app.task(bind=True)
+def email_jar_schedule(self, data=None, **kwargs):
+    base_dir = Path(settings.BASE_DIR)
+    jar_path = base_dir / "email-sender-0.0.1-SNAPSHOT.jar"
+
+    if not jar_path.exists():
+        logger.error(f"JAR file not found: {jar_path}")
+        raise FileNotFoundError(f"JAR file not found: {jar_path}")
+    if data and "data" in data:
+        data = data["data"]
+    files = data.get("files") if data else []
+    attached_files = ", ".join(files) if files else "No files"
+    
+    process_id = data.get("process_id")
+    logs = "\n".join(data.get("message", []))
+
+    subject = f"{kwargs.get('subject', 'Task Update')} | Process ID: {process_id}"
+    body = f"{kwargs.get('message_body', '')}\n\nTask Logs:\n{logs}"
+
+    cmd = [
+        "java", "-jar", str(jar_path),
+        f"--host={kwargs.get('host')}",
+        f"--port={kwargs.get('port')}",
+        f"--tls={'true' if kwargs.get('tls') else 'false'}",
+        f"--user={kwargs.get('user')}",
+        f"--pass={kwargs.get('password')}",
+        f"--to={kwargs.get('to_str')}",
+        f"--subject={subject}",
+        f"--body={body}",
+        f"--attach={attached_files}", 
+    ]
+    logger.info(f"Executing command: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    logger.info(f"Process finished with code {result.returncode}")
+    if result.stdout:
+        logger.debug(f"STDOUT: {result.stdout.strip()}")
+    if result.stderr:
+        logger.error(f"STDERR: {result.stderr.strip()}")
+    status = "success" if result.returncode == 0 else "failed"
+    return {
+        "process_id": getattr(self.request, "id", None),
+        "returncode": result.returncode,
+        "status": status,
+        "stdout": result.stdout.strip(),
+        "stderr": result.stderr.strip(),
+    }
+
+@app.task(bind=True, name="core.tasks.pick_file_task")
+@safe_execute
+def pick_file_task(self):
+    base_dir = Path(settings.BASE_DIR)
+    folder = base_dir / "download_file"
+    files = [str(f) for f in folder.glob("*") if f.is_file()]
+    if not files:
+        raise FileNotFoundError("No files found in download_file folder")
+    return {"process_id": self.request.id, "status": "success", "files": files}
+
+
+# def send_email_via_jar(taskname, message, email_conn):
+#     base_dir = Path(settings.BASE_DIR)
+#     jar_path = base_dir / "email-sender-0.0.1-SNAPSHOT.jar"
+#     if not jar_path.exists():
+#         raise FileNotFoundError(f"JAR file not found: {jar_path}")
+#     to_list = email_conn.to if isinstance(email_conn.to, list) else [email_conn.to]
+#     to_str = ",".join(to_list)
+#     cmd = [
+#         "java", "-jar", str(jar_path),
+#         f"--host={email_conn.host}",
+#         f"--port={email_conn.port}",
+#         f"--tls={'true' if email_conn.tls else 'false'}",
+#         f"--user={email_conn.user}",
+#         f"--pass={email_conn.password}",
+#         f"--to={to_str}",
+#         f"--subject={taskname} {email_conn.subject}",
+#         f"--body={email_conn.message}\n{message}",
+#     ]
+#     if getattr(email_conn, "attachments", None):
+#         for file_path in email_conn.attachments:
+#             if Path(file_path).exists():
+#                 cmd.append(f"--attach={file_path}")
+
+#     result = subprocess.run(cmd, capture_output=True, text=True)
+#     return {
+#         "returncode": result.returncode,
+#         "stdout": result.stdout.strip(),
+#         "stderr": result.stderr.strip(),
+#     }
 
 def create_virtual_env(script_name):
     venv_dir = os.path.join(BASE_VENV_DIR, script_name)
@@ -93,20 +196,16 @@ def install_libraries(venv_path, libraries):
         if os.name == "nt"
         else os.path.join(venv_path, "bin", "pip")
     )
-
-    # user may give "pip install pandas numpy"
     parts = libraries.strip().split()
     if parts[0].lower() == "pip" and parts[1].lower() == "install":
-        libs = parts[2:]  # everything after "pip install"
+        libs = parts[2:] 
     else:
-        # fallback: assume space-separated libs
         libs = libraries.split()
-
     if libs:
         subprocess.check_call([pip_path, "install", "--default-timeout=1000"] + libs)
 
-
-@shared_task(bind=True)
+@app.task(bind=True, name="core.tasks.run_script_task")
+@safe_execute
 def run_script_task(self, **kwargs):
     try:
         script = Script.objects.get(name=kwargs["name"])
@@ -137,3 +236,30 @@ def run_script_task(self, **kwargs):
         }
     except Exception as e:
         return {"error": str(e)}
+
+@shared_task(bind=True)
+def orchestrator_chain_task(self, **kwargs):
+    task_names = kwargs.get("task_names", [])
+    if not task_names:
+        raise ValueError("No task names provided in kwargs['task_names'].")
+    task_signatures = []
+    for name in task_names:
+        try:
+            ptask = PeriodicTask.objects.get(name=name)
+        except PeriodicTask.DoesNotExist:
+            raise ValueError(f"PeriodicTask '{name}' not found.")
+        if not ptask.task:
+            raise ValueError(f"PeriodicTask '{name}' has no task defined.")
+        task_kwargs = json.loads(ptask.kwargs or "{}")
+        sig = signature(ptask.task, kwargs=task_kwargs)
+        task_signatures.append(sig)
+
+    if not task_signatures:
+        raise ValueError("No valid tasks to chain.")
+    workflow = chain(*task_signatures)
+    result = workflow.apply_async()
+    return {
+        "status": "Chain started",
+        "chain_id": result.id,
+        "tasks": task_names,
+    }
